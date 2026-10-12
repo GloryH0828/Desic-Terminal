@@ -432,18 +432,16 @@ function validEnvironmentVariableName(value) {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
-export function codexProviderOverrides(route, options = {}) {
+export function codexProviderOverrides(route) {
   if (!route || typeof route !== "object") {
-    if (options.defaultRetryPolicy !== true) return {};
-    // Codex CLI's user config owns the provider name. Cover the conventional
-    // spellings without changing the user's endpoint or authentication setup.
-    return Object.fromEntries(["OpenAI", "openai"].flatMap((providerId) => [
-      [`model_providers.${providerId}.request_max_retries`, 0],
-      [`model_providers.${providerId}.stream_max_retries`, 0],
-      [`model_providers.${providerId}.stream_idle_timeout_ms`, 30_000]
-    ]));
+    // Built-in providers are owned by Codex. Even a nested retry override
+    // creates a custom provider table and newer CLIs reject reserved IDs.
+    return {};
   }
   const providerId = String(route.providerId || "").trim();
+  if (["openai", "ollama", "lmstudio"].includes(providerId)) {
+    throw new Error(`Codex 内置 Provider ID ${providerId} 不可用于自定义路由，请为自定义 Provider 使用独立名称。`);
+  }
   const name = String(route.name || providerId).replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 120);
   const wireApi = String(route.wireApi || "responses").trim();
   let baseUrl;
@@ -718,7 +716,7 @@ function codexAppServerSettings(config, bridge, serverConfig, isolatedCli) {
     },
     configOverrides: {
       ...codexIsolationOverrides(bridge.openAgent === true),
-      ...codexProviderOverrides(bridge.providerRoute, { defaultRetryPolicy: true }),
+      ...codexProviderOverrides(bridge.providerRoute),
       ...codexReasoningOverrides(bridge.reasoningEffort),
       // Codex owns provider-executed MCP calls. Only the tools already filtered by
       // Desic policy are exposed on this authenticated, per-run loopback server.

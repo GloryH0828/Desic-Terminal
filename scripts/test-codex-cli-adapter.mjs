@@ -97,9 +97,15 @@ assert.deepEqual(codexProviderOverrides({
 }), {});
 assert.deepEqual(codexProviderOverrides(undefined), {});
 const defaultRetryOverrides = codexProviderOverrides(undefined, { defaultRetryPolicy: true });
-assert.equal(defaultRetryOverrides["model_providers.OpenAI.request_max_retries"], 0);
-assert.equal(defaultRetryOverrides["model_providers.OpenAI.stream_max_retries"], 0);
-assert.equal(defaultRetryOverrides["model_providers.OpenAI.stream_idle_timeout_ms"], 30_000);
+assert.deepEqual(defaultRetryOverrides, {});
+assert.deepEqual(codexProviderOverrides(null), {});
+for (const providerId of ["openai", "ollama", "lmstudio"]) {
+  assert.throws(() => codexProviderOverrides({
+    providerId,
+    baseUrl: "https://gateway.example.invalid/v1",
+    wireApi: "responses"
+  }), /内置 Provider ID/);
+}
 
 const detailedError = codexErrorMessage({
   message: "Codex CLI exited with code 1",

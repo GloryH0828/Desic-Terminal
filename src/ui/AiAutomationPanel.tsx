@@ -1579,7 +1579,7 @@ function ProfileEditor({
             <EditorToggle checked={draft.enabled} ariaLabel={t("automation:profileEnableToggle")} disabled={busy} onChange={(enabled) => onChange({ enabled })} />
             {draft.enabled ? t("common:enabled") : t("common:disabled")}
           </span>
-          <button type="button" className="pfe-btn" onClick={onRun} disabled={busy || !draft.id} title={t("automation:profileRunNow")}><Play size={13} />{t("automation:profileRunOnce")}</button>
+          <button type="button" className="pfe-btn" onClick={onRun} disabled={busy || savedAt === null || dirty || !draft.enabled} title={t(savedAt === null || dirty ? "automation:profileRunSaveFirst" : !draft.enabled ? "automation:profileRunEnableFirst" : "automation:profileRunNow")} data-profile-run><Play size={13} />{t("automation:profileRunOnce")}</button>
           <button type="button" className="pfe-btn is-ghost is-icon is-danger" onClick={onDelete} disabled={busy} title={t("automation:profileDelete")} aria-label={t("automation:profileDelete")}><Trash2 size={15} /></button>
           <button type="button" className="pfe-btn is-ghost is-icon" onClick={onClose} title={t("common:close")} aria-label={t("common:close")}><X size={16} /></button>
         </div>
@@ -1982,7 +1982,7 @@ function ProfileEditor({
                   <div className="pfe-row">
                     <span className="pfe-row__label">{t("automation:profileDeliveryDailyReview")} <HelpTip text={t("automation:profileDeliveryDailyReviewHelp")} /></span>
                     <div className="pfe-row__control">
-                      <button type="button" className="pfe-btn is-ghost is-small" onClick={onDailyReview} disabled={busy || !draft.enabled || !draft.id}><History size={13} />{t("automation:profileDeliveryRunReview")}</button>
+                      <button type="button" className="pfe-btn is-ghost is-small" onClick={onDailyReview} disabled={busy || !draft.enabled || savedAt === null || dirty} title={savedAt === null || dirty ? t("automation:profileRunSaveFirst") : undefined}><History size={13} />{t("automation:profileDeliveryRunReview")}</button>
                       <EditorToggle checked={draft.dailyReviewEnabled} ariaLabel={t("automation:profileDeliveryDailyReview")} disabled={busy} onChange={(dailyReviewEnabled) => onChange({ dailyReviewEnabled })} />
                     </div>
                   </div>
@@ -5774,13 +5774,30 @@ function AiAutomationPanelComponent({
     }
   }, [loadSection, onNotify, t]);
 
+  // Compare with the persisted Profile; a generated draft ID is not proof of a save.
+  const profileDraftDirty = useMemo(() => {
+    if (!profileDraft) return false;
+    const saved = (summary?.profiles ?? []).find((item) => item.id === profileDraft.id);
+    if (!saved) return true;
+    const baseline = normalizeProfile({ ...saved, model: resolveProfileModelId(saved.model, aiConfig) });
+    return JSON.stringify(baseline) !== JSON.stringify(profileDraft);
+  }, [aiConfig, profileDraft, summary?.profiles]);
+
   const runProfileNow = useCallback(() => {
     if (!profileDraft) return;
+    if (profileDraftDirty || !(summary?.profiles ?? []).some((item) => item.id === profileDraft.id)) {
+      onNotify({ kind: "warning", title: t("automation:profileNotSaved"), message: t("automation:profileRunSaveFirst") });
+      return;
+    }
     runProfileById(profileDraft);
-  }, [profileDraft, runProfileById]);
+  }, [profileDraft, profileDraftDirty, summary, onNotify, t, runProfileById]);
 
   const runDailyReview = useCallback(() => {
     if (!profileDraft) return;
+    if (profileDraftDirty || !(summary?.profiles ?? []).some((item) => item.id === profileDraft.id)) {
+      onNotify({ kind: "warning", title: t("automation:profileNotSaved"), message: t("automation:profileRunSaveFirst") });
+      return;
+    }
     void runCommand(
       `profile-daily-review:${profileDraft.id}`,
       "ai_agent_profile_run_daily_review",
@@ -5789,7 +5806,7 @@ function AiAutomationPanelComponent({
       t("automation:profileDailyReviewSubmittedMessage", { name: profileDraft.name }),
       profileDraft.id
     );
-  }, [profileDraft, runCommand, t]);
+  }, [profileDraft, profileDraftDirty, summary, onNotify, runCommand, t]);
 
   const handleTabClick = useCallback((id: AiAutomationTab) => {
     setActiveTab(id);
@@ -5928,17 +5945,6 @@ function AiAutomationPanelComponent({
     setProfileDraft(resume ?? normalizeProfile({ ...profile, model: resolveProfileModelId(profile.model, aiConfig) }));
     setProfileEditorOpen(true);
   }, [aiConfig?.activeModelId, aiConfig?.models, onNotify, profileDraft, t]);
-
-  // Unsaved edits are detected by comparing the draft with the stored Profile it
-  // came from, normalized the same way, so no separate dirty flag can drift.
-  const profileDraftDirty = useMemo(() => {
-    if (!profileDraft) return false;
-    const saved = (summary?.profiles ?? []).find((item) => item.id === profileDraft.id);
-    // A Profile that was never saved is dirty by definition.
-    if (!saved) return true;
-    const baseline = normalizeProfile({ ...saved, model: resolveProfileModelId(saved.model, aiConfig) });
-    return JSON.stringify(baseline) !== JSON.stringify(profileDraft);
-  }, [aiConfig, profileDraft, summary?.profiles]);
 
   const closeProfileEditor = useCallback(() => {
     if (!profileDraftDirty) {
@@ -7557,6 +7563,7 @@ const AUTOMATION_PREVIEW_DEMO_RISK_FACTS: RiskFacts = {
 
 const AUTOMATION_PREVIEW_EDITOR_PROFILE: AiAgentProfile = {
   ...createProfile(AUTOMATION_PREVIEW_ACCOUNTS, "preview-model"),
+  enabled: true,
   id: "profile-preview-editor",
   name: "新自动化 Profile 2",
   mode: "limited_auto",
@@ -7575,6 +7582,7 @@ const AUTOMATION_PREVIEW_EDITOR_PROFILE: AiAgentProfile = {
 
 export function AutomationPreview() {
   const requestedView = typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("view") : null;
+  const previewUnsavedProfile = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("unsaved") === "1";
   const previewViews = ["run", "single-run", "refresh", "model-error", "optimization", "reviews", "agents", "triage", "minimal", "new-profile", "fastlane-config", "fastlane-run", "pulse", "scorecard", "trader-handbook", "trader-instructions", "profile-editor"];
   const initialView = requestedView && previewViews.includes(requestedView) ? requestedView : "config";
   const [view, setView] = useState<string>(initialView);
@@ -7742,7 +7750,7 @@ export function AutomationPreview() {
                   agentsError={null}
                   busy={false}
                   dirty={previewEditorDraft !== AUTOMATION_PREVIEW_EDITOR_PROFILE}
-                  savedAt={AUTOMATION_PREVIEW_EDITOR_PROFILE.updatedAt}
+                  savedAt={previewUnsavedProfile ? null : AUTOMATION_PREVIEW_EDITOR_PROFILE.updatedAt}
                   recentInputTokens={[135_886, 55_548, 237_476, 93_678]}
                   previewFacts={previewEditorDraft.accountId === "preview-demo" ? AUTOMATION_PREVIEW_DEMO_RISK_FACTS : AUTOMATION_PREVIEW_LIVE_RISK_FACTS}
                   previewTraderSummary={PREVIEW_TRADER_SCORECARD}

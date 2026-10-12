@@ -4399,7 +4399,9 @@ fn load_profile(conn: &Connection, id: &str) -> Result<AiAgentProfileSummary, St
             params![id],
             profile_from_row,
         )
-        .map_err(|err| err.to_string())?;
+        .optional()
+        .map_err(|err| format!("读取 Agent Profile 失败：{err}"))?
+        .ok_or_else(|| "Agent Profile 尚未保存或已删除，请先保存配置或刷新列表".to_string())?;
     apply_legacy_agent_migration(conn, &mut profile);
     Ok(profile)
 }
@@ -5661,8 +5663,16 @@ fn parse_background_finish_failure(tool_json: &str) -> Option<String> {
         return Some("background.finishRun 调用未返回结果".to_string());
     };
     let result = result_event.get("result").unwrap_or(result_event);
-    let completed = result.get("accepted").and_then(Value::as_bool) == Some(true)
-        || result.get("executed").and_then(Value::as_bool) == Some(true);
+    let rejected = result_event.get("ok").and_then(Value::as_bool) == Some(false)
+        || result.get("accepted").and_then(Value::as_bool) == Some(false)
+        || result.get("executed").and_then(Value::as_bool) == Some(false)
+        || result.get("validation").and_then(|value| value.get("ok")).and_then(Value::as_bool) == Some(false);
+    let completed = !rejected && (
+        result.get("accepted").and_then(Value::as_bool) == Some(true)
+        || result.get("executed").and_then(Value::as_bool) == Some(true)
+        || (result_event.get("ok").and_then(Value::as_bool) == Some(true)
+            && matches!(result.get("status").and_then(Value::as_str), Some("completed" | "skipped")))
+    );
     if completed {
         return None;
     }
@@ -8553,7 +8563,9 @@ pub(crate) fn background_finish_run(
         Some(created_wake_condition_ids.clone())
     };
     Ok(json!({
-        "status": "completed",
+        "status": status,
+        "accepted": true,
+        "executed": true,
         "runId": run_id,
         "profileId": profile_id,
         "createdOpportunityIds": created_opportunity_ids,
@@ -13396,6 +13408,26 @@ async fn execute_profile_run(
     finalize_profile_run_if_needed(&app, &run.id, &profile, stream_error)
 }
 
+fn profile_run_has_successful_or_cancelled_terminal_state(status: &str) -> bool {
+    matches!(status, "completed" | "skipped" | "cancelled")
+}
+
+fn fail_unfinished_profile_run(
+    conn: &Connection,
+    run_id: &str,
+    message: &str,
+    now: i64,
+    next_wake_at: i64,
+) -> Result<bool, String> {
+    conn.execute(
+        "UPDATE ai_agent_runs SET status='failed',error=?2,finished_at=?3,next_wake_at=?4,updated_at=?3
+         WHERE id=?1 AND status NOT IN ('completed','skipped','cancelled')",
+        params![run_id, message, now, next_wake_at],
+    )
+    .map(|changed| changed > 0)
+    .map_err(|error| error.to_string())
+}
+
 fn finalize_profile_run_if_needed(
     app: &tauri::AppHandle,
     run_id: &str,
@@ -13410,7 +13442,7 @@ fn finalize_profile_run_if_needed(
             |row| row.get::<_, String>(0),
         )
         .map_err(|err| err.to_string())?;
-    if matches!(status.as_str(), "completed" | "cancelled") {
+    if profile_run_has_successful_or_cancelled_terminal_state(&status) {
         return Ok(());
     }
     let message = stream_error.unwrap_or_else(|| {
@@ -13427,12 +13459,9 @@ fn finalize_profile_run_if_needed(
         .unwrap_or(0);
     let backoff_minutes =
         (1_i64 << failed_count.min(5)).min(i64::from(profile.scan_interval_minutes.max(1)));
-    conn.execute(
-        "UPDATE ai_agent_runs SET status='failed',error=?2,finished_at=?3,next_wake_at=?4,updated_at=?3
-         WHERE id=?1 AND status!='completed'",
-        params![run_id, message, now, now.saturating_add(backoff_minutes * 60_000)],
-    )
-    .map_err(|err| err.to_string())?;
+    if !fail_unfinished_profile_run(&conn, run_id, &message, now, now.saturating_add(backoff_minutes * 60_000))? {
+        return Ok(());
+    }
     let trigger_type = conn
         .query_row(
             "SELECT trigger_type FROM ai_agent_runs WHERE id=?1",
@@ -15531,6 +15560,47 @@ mod tests {
     }
 
     #[test]
+    fn background_finish_success_accepts_persisted_completed_and_skipped_results() {
+        for status in ["completed", "skipped"] {
+            let events = json!([
+                { "type": "toolCall", "toolCallId": "placeholder-finish", "name": "background.finishRun" },
+                { "type": "toolResult", "toolCallId": "placeholder-finish", "ok": true,
+                  "result": { "status": status, "validation": { "ok": true }, "wakeConditions": 6 } }
+            ]);
+            assert_eq!(parse_background_finish_failure(&events.to_string()), None);
+            let mut rejected = events.clone();
+            rejected[1]["result"]["accepted"] = json!(false);
+            rejected[1]["result"]["errors"] = json!(["placeholder validation rejection"]);
+            assert!(parse_background_finish_failure(&rejected.to_string()).is_some());
+            let mut transport_failure = events.clone();
+            transport_failure[1]["ok"] = json!(false);
+            assert!(parse_background_finish_failure(&transport_failure.to_string()).is_some());
+        }
+    }
+
+    #[test]
+    fn profile_run_finalization_preserves_success_skip_and_cancel_terminal_states() {
+        let conn = Connection::open_in_memory().expect("open database");
+        conn.execute_batch("CREATE TABLE ai_agent_runs(id TEXT PRIMARY KEY,status TEXT,error TEXT,finished_at INTEGER,next_wake_at INTEGER,updated_at INTEGER);")
+            .expect("create run table");
+        for status in ["completed", "skipped", "cancelled", "queued", "running"] {
+            conn.execute("INSERT INTO ai_agent_runs VALUES(?1,?1,NULL,10,77,10)", params![status]).expect("insert run");
+            // Models finish or users cancel between the finalizer's read and its write.
+            let terminal = profile_run_has_successful_or_cancelled_terminal_state(status);
+            assert_eq!(fail_unfinished_profile_run(&conn, status, "placeholder failure", 99, 101).expect("finalize"), !terminal);
+            let row: (String, Option<String>, i64, i64) = conn.query_row(
+                "SELECT status,error,finished_at,next_wake_at FROM ai_agent_runs WHERE id=?1", params![status],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).expect("read final state");
+            if terminal {
+                assert_eq!(row, (status.to_string(), None, 10, 77));
+            } else {
+                assert_eq!(row, ("failed".to_string(), Some("placeholder failure".to_string()), 99, 101));
+            }
+        }
+    }
+
+    #[test]
     fn usage_backfill_is_idempotent_and_preserves_raw_tool_history() {
         let mut conn = Connection::open_in_memory().expect("open usage backfill database");
         conn.execute_batch(
@@ -16564,6 +16634,19 @@ mod tests {
             )
             .expect("query deleted_at after re-save");
         assert_eq!(deleted_after_resave, None, "重存不得软删除已有 Profile");
+    }
+
+    #[test]
+    fn unsaved_profile_run_target_returns_actionable_error() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        migrate_ai_automation(&conn).expect("migrate automation schema");
+        let error = queue_run(&conn, "placeholder-unsaved-profile", "manual", json!({ "requestedBy": "user" }))
+            .expect_err("an unsaved draft must never enqueue a run");
+        assert!(error.contains("尚未保存或已删除"), "{error}");
+        assert!(!error.contains("Query returned no rows"));
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM ai_agent_runs", [], |row| row.get(0))
+            .expect("count queued runs");
+        assert_eq!(count, 0);
     }
 
     #[test]

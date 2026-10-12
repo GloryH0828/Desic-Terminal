@@ -2888,6 +2888,30 @@ fn safe_cli_version(output: &std::process::Output) -> Option<String> {
     Some(line.chars().take(80).collect())
 }
 
+fn desktop_codex_cli_candidates(local_app_data: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    // Desktop updates install the CLI in a versioned bin directory which may
+    // not be present in the PATH inherited by a Start-menu-launched app.
+    for application in ["ChatGPT", "Codex"] {
+        let bin = local_app_data.join("OpenAI").join(application).join("bin");
+        candidates.push(bin.join("codex.exe"));
+        if let Ok(entries) = fs::read_dir(&bin) {
+            let mut versioned = entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+                .map(|entry| {
+                    let modified = entry.metadata().ok().and_then(|metadata| metadata.modified().ok());
+                    (modified, entry.path().join("codex.exe"))
+                })
+                .collect::<Vec<_>>();
+            // Directory names can be content hashes, not sortable versions.
+            versioned.sort_by(|left, right| right.cmp(left));
+            candidates.extend(versioned.into_iter().map(|(_, path)| path));
+        }
+    }
+    candidates
+}
+
 fn ai_cli_candidates(program: &str) -> Vec<PathBuf> {
     let executable_name = if cfg!(windows) {
         format!("{program}.cmd")
@@ -2942,10 +2966,27 @@ fn ai_cli_candidates(program: &str) -> Vec<PathBuf> {
             PathBuf::from("/usr/local/bin").join(&executable_name),
         ]);
     } else {
+        if let Some(path) = std::env::var_os("PATH") {
+            for directory in std::env::split_paths(&path).filter(|path| path.is_absolute()) {
+                candidates.push(directory.join(format!("{program}.exe")));
+                candidates.push(directory.join(&executable_name));
+            }
+        }
+        if program == "codex" {
+            let local_app_data = std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join("AppData/Local")));
+            if let Some(local_app_data) = local_app_data {
+                candidates.extend(desktop_codex_cli_candidates(&local_app_data));
+            }
+        }
         candidates.push(PathBuf::from(program));
     }
     let mut unique = Vec::new();
     for candidate in candidates {
+        if candidate.is_absolute() && !candidate.is_file() {
+            continue;
+        }
         if !unique.contains(&candidate) {
             unique.push(candidate);
         }
@@ -2970,9 +3011,12 @@ fn hide_windows_std_command_window(command: &mut std::process::Command) {
 }
 
 async fn ai_cli_output(program: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
-    let mut command = if cfg!(windows) {
+    let batch = program.extension().and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat"))
+        .unwrap_or(false);
+    let mut command = if cfg!(windows) && (batch || !program.is_absolute()) {
         let mut command = tokio::process::Command::new("cmd");
-        command.arg("/C").arg(program);
+        command.arg("/D").arg("/C").arg(program);
         command
     } else {
         tokio::process::Command::new(program)
@@ -6706,6 +6750,40 @@ wire_api = "responses"
             assert!(summary.configured);
             assert_eq!(summary.api_key_masked, "本机 CLI");
         }
+    }
+
+    #[test]
+    fn desktop_codex_discovery_covers_versioned_and_legacy_installations() {
+        let root = std::env::temp_dir().join(format!(
+            "desic desktop cli discovery {} {}", std::process::id(), rand::random::<u64>()
+        ));
+        let chatgpt_bin = root.join("OpenAI/ChatGPT/bin");
+        let legacy_bin = root.join("OpenAI/Codex/bin");
+        for directory in [chatgpt_bin.join("placeholder-version-a"), chatgpt_bin.join("placeholder-version-b"), legacy_bin.clone()] {
+            fs::create_dir_all(&directory).expect("create desktop fixture");
+            fs::write(directory.join("codex.exe"), b"placeholder-cli").expect("write fixture");
+        }
+        let nested = chatgpt_bin.join("placeholder-version-a/unrelated");
+        fs::create_dir_all(&nested).expect("create unrelated fixture");
+        fs::write(nested.join("codex.exe"), b"placeholder-cli").expect("write nested fixture");
+        let existing = desktop_codex_cli_candidates(&root).into_iter()
+            .filter(|path| path.is_file()).collect::<Vec<_>>();
+        assert_eq!(existing.len(), 3);
+        assert!(existing.contains(&chatgpt_bin.join("placeholder-version-a/codex.exe")));
+        assert!(existing.contains(&chatgpt_bin.join("placeholder-version-b/codex.exe")));
+        assert!(existing.contains(&legacy_bin.join("codex.exe")));
+        assert!(!existing.contains(&nested.join("codex.exe")));
+        fs::remove_dir_all(&root).expect("remove owned desktop fixture");
+        assert!(desktop_codex_cli_candidates(&root).iter().all(|path| !path.is_file()));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn local_cli_probe_runs_native_executables_directly() {
+        let executable = std::env::current_exe().expect("test executable");
+        let output = ai_cli_output(&executable, &["--list"]).await.expect("native CLI probe");
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("desktop_codex_discovery"));
     }
 
     #[test]

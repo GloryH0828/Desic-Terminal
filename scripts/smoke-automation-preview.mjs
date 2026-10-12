@@ -1891,6 +1891,7 @@ async function verifyProfileEditor(page, scenario) {
   const label = `${scenario.label}/profile-editor`;
   await page.goto(`${baseUrl}?view=profile-editor&slow=6`, { waitUntil: "networkidle", timeout: 60_000 });
   await page.waitForSelector("[data-profile-editor]", { timeout: 20_000 });
+  if (!(await page.locator('[data-profile-run]').isEnabled())) throw new Error(`${label}: saved enabled Profile must be runnable`);
   const tabs = await page.locator("[data-profile-page-tab]").count();
   if (tabs !== 5) throw new Error(`${label}: 应有 5 个分页（实际 ${tabs}）`);
   const summary = () => page.locator("[data-profile-summary]").first().innerText();
@@ -1916,6 +1917,7 @@ async function verifyProfileEditor(page, scenario) {
   const riskInput = page.locator('[data-profile-field="riskPerTradePct"] .pfe-number input');
   await riskInput.fill("12.5");
   await riskInput.blur();
+  if (!(await page.locator('[data-profile-run]').isDisabled())) throw new Error(`${label}: unsaved edits must block running the old settings`);
   await waitUntil(summary, (value) => /1\.16 U/.test(value), `${label}: 单笔 12.5% 后概览应为 1.16 U`);
 
   // 杠杆快选：10x 时 BTC 最小仓位保证金翻倍到 0.85 U。
@@ -1961,6 +1963,14 @@ async function verifyProfileEditor(page, scenario) {
   const viewport = page.viewportSize();
   if (!editorBox || !viewport || editorBox.width > viewport.width + 1) throw new Error(`${label}: 配置窗口横向溢出`);
   await page.screenshot({ path: path.join(artifactDir, `profile-editor-${scenario.label}.png`) });
+  await page.goto(`${baseUrl}?view=profile-editor&unsaved=1`, { waitUntil: "networkidle", timeout: 60_000 });
+  await page.waitForSelector('[data-profile-run]', { timeout: 20_000 });
+  for (const mode of ['briefing', 'tools']) {
+    await page.locator(`[data-preview-editor-kind="${mode}"]`).click();
+    if (!(await page.locator('[data-profile-run]').isDisabled())) throw new Error(`${label}: unsaved ${mode} Profile must not run even with a draft ID`);
+    const hint = await page.locator('[data-profile-run]').getAttribute('title');
+    if (!/保存|Save/i.test(hint || '')) throw new Error(`${label}: unsaved Profile needs a save-first hint`);
+  }
 }
 
 // 交易员成绩单：分组表（含「建议暂停」与暂停 / 恢复按钮）、最近决策、交易手册。
